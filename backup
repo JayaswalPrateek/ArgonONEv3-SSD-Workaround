@@ -1,0 +1,211 @@
+#!/bin/bash
+
+# Headless version of piclone for backing up Raspberry Pi drives
+# Usage: ./piclone.sh <source_device> <destination_device> [--new-uuid]
+
+SUDO_PREFIX="sudo "
+
+# Check arguments
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <source_device> <destination_device> [--new-uuid]"
+    echo "Example: $0 /dev/mmcblk0 /dev/sda --new-uuid"
+    exit 1
+fi
+
+SRC_DEV=$1
+DST_DEV=$2
+NEW_UUID=0
+
+if [ "$3" == "--new-uuid" ]; then
+    NEW_UUID=1
+fi
+
+# Validate devices exist
+if [ ! -b "$SRC_DEV" ]; then
+    echo "Error: Source device $SRC_DEV does not exist"
+    exit 1
+fi
+
+if [ ! -b "$DST_DEV" ]; then
+    echo "Error: Destination device $DST_DEV does not exist"
+    exit 1
+fi
+
+# Safety check - don't allow source and destination to be the same
+if [ "$SRC_DEV" == "$DST_DEV" ]; then
+    echo "Error: Source and destination devices cannot be the same"
+    exit 1
+fi
+
+# Check if source has an MSDOS partition table
+PART_TABLE=$(${SUDO_PREFIX}parted $SRC_DEV print | grep "Partition Table:" | cut -d: -f2 | tr -d ' ')
+if [ "$PART_TABLE" != "msdos" ]; then
+    echo "Error: Source device must have an MSDOS partition table"
+    exit 1
+fi
+
+# Function to get partition device name based on device type
+get_partition_device() {
+    local device=$1
+    local partition_num=$2
+    
+    if [[ $device == *"mmcblk"* ]] || [[ $device == *"nvme"* ]]; then
+        echo "${device}p${partition_num}"
+    else
+        echo "${device}${partition_num}"
+    fi
+}
+
+# Get device sizes in sectors
+get_device_size() {
+    local device=$1
+    ${SUDO_PREFIX}parted $device unit s print | grep "Disk.*sectors" | cut -d: -f2 | cut -d's' -f1 | tr -d ' '
+}
+
+# Unmount any mounted partitions on the destination device
+echo "Unmounting destination partitions..."
+for i in $(seq 1 9); do
+    partition=$(get_partition_device $DST_DEV $i)
+    ${SUDO_PREFIX}umount $partition 2>/dev/null
+done
+
+# Wipe the FAT on the target
+echo "Preparing destination device..."
+${SUDO_PREFIX}dd if=/dev/zero of=$DST_DEV bs=512 count=1
+
+# Create temporary mount points
+SRC_MNT=$(mktemp -d)
+DST_MNT=$(mktemp -d)
+
+# Prepare the new partition table
+${SUDO_PREFIX}parted -s $DST_DEV mklabel msdos
+
+# Read source partition table
+echo "Reading source partition table..."
+PARTITIONS=$(${SUDO_PREFIX}parted $SRC_DEV unit s print | sed '/^ /!d')
+
+# Generate new UUID if requested
+if [ $NEW_UUID -eq 1 ]; then
+    NEW_PUUID=$(uuid | cut -f1 -d-)
+fi
+
+# Store the last regular partition number
+LAST_PART_NUM=0
+LAST_PART_TYPE=""
+LAST_PART_FSTYPE=""
+
+# Process each partition
+echo "Processing partitions..."
+while read -r line; do
+    # Parse partition info
+    PNUM=$(echo $line | awk '{print $1}')
+    START=$(echo $line | awk '{print $2}' | sed 's/s$//')
+    END=$(echo $line | awk '{print $3}' | sed 's/s$//')
+    TYPE=$(echo $line | awk '{print $5}')
+    FSTYPE=$(echo $line | awk '{print $6}')
+    FLAGS=$(echo $line | awk '{print $7}')
+
+    echo "Processing partition $PNUM..."
+    
+    # Create partition
+    if [ "$TYPE" == "extended" ]; then
+        ${SUDO_PREFIX}parted -s $DST_DEV -- mkpart extended ${START}s -1s
+    else
+        ${SUDO_PREFIX}parted -s $DST_DEV mkpart $TYPE $FSTYPE ${START}s ${END}s
+        LAST_PART_NUM=$PNUM
+        LAST_PART_TYPE=$TYPE
+        LAST_PART_FSTYPE=$FSTYPE
+    fi
+
+    # Refresh partition table
+    ${SUDO_PREFIX}partprobe
+
+    # Skip filesystem creation for extended partitions
+    if [ "$TYPE" != "extended" ]; then
+        PART_DEV=$(get_partition_device $DST_DEV $PNUM)
+        
+        # Get source UUID and label
+        SRC_PART=$(get_partition_device $SRC_DEV $PNUM)
+        UUID=$(${SUDO_PREFIX}blkid -s UUID -o value $SRC_PART)
+        LABEL=$(${SUDO_PREFIX}blkid -s LABEL -o value $SRC_PART)
+
+        # Create filesystem
+        if [[ $FSTYPE == "fat"* ]]; then
+            if [ ! -z "$UUID" ]; then
+                ${SUDO_PREFIX}mkfs.fat -F 32 -i $UUID $PART_DEV
+            else
+                ${SUDO_PREFIX}mkfs.fat -F 32 $PART_DEV
+            fi
+            [ ! -z "$LABEL" ] && ${SUDO_PREFIX}fatlabel $PART_DEV "$LABEL"
+        elif [ "$FSTYPE" == "ext4" ]; then
+            if [ ! -z "$UUID" ]; then
+                ${SUDO_PREFIX}mkfs.ext4 -F -U $UUID $PART_DEV
+            else
+                ${SUDO_PREFIX}mkfs.ext4 -F $PART_DEV
+            fi
+            [ ! -z "$LABEL" ] && ${SUDO_PREFIX}e2label $PART_DEV "$LABEL"
+        fi
+
+        # Mount and copy
+        echo "Copying partition $PNUM..."
+        ${SUDO_PREFIX}mount $PART_DEV $DST_MNT
+        ${SUDO_PREFIX}mount $SRC_PART $SRC_MNT
+        ${SUDO_PREFIX}cp -ax $SRC_MNT/. $DST_MNT/.
+        
+        # Update UUIDs in fstab and cmdline.txt if requested
+        if [ $NEW_UUID -eq 1 ]; then
+            OLD_PUUID=$(${SUDO_PREFIX}blkid $SRC_DEV | rev | cut -f 2 -d ' ' | rev | cut -f 2 -d \")
+            if [ ! -z "$OLD_PUUID" ] && [ ! -z "$NEW_PUUID" ]; then
+                if [ -f "$DST_MNT/etc/fstab" ]; then
+                    ${SUDO_PREFIX}sed -i "s/$OLD_PUUID/$NEW_PUUID/g" "$DST_MNT/etc/fstab"
+                fi
+                if [ -f "$DST_MNT/cmdline.txt" ]; then
+                    ${SUDO_PREFIX}sed -i "s/$OLD_PUUID/$NEW_PUUID/g" "$DST_MNT/cmdline.txt"
+                fi
+            fi
+        fi
+
+        # Unmount
+        ${SUDO_PREFIX}umount $DST_MNT
+        ${SUDO_PREFIX}umount $SRC_MNT
+    fi
+
+    # Set partition flags
+    if [ "$FLAGS" == "lba" ]; then
+        ${SUDO_PREFIX}parted -s $DST_DEV set $PNUM lba on
+    fi
+done <<< "$PARTITIONS"
+
+# Check if destination drive is larger and expand last partition if possible
+if [ $LAST_PART_NUM -gt 0 ]; then
+    echo "Checking if partition expansion is possible..."
+    SRC_SIZE=$(get_device_size $SRC_DEV)
+    DST_SIZE=$(get_device_size $DST_DEV)
+    
+    if [ $DST_SIZE -gt $SRC_SIZE ]; then
+        echo "Destination drive is larger. Expanding last partition..."
+        
+        # Resize the last partition to use all available space
+        ${SUDO_PREFIX}parted -s $DST_DEV resizepart $LAST_PART_NUM 100%
+        
+        # Resize the filesystem
+        LAST_PART_DEV=$(get_partition_device $DST_DEV $LAST_PART_NUM)
+        if [ "$LAST_PART_FSTYPE" == "ext4" ]; then
+            echo "Resizing ext4 filesystem..."
+            ${SUDO_PREFIX}e2fsck -f $LAST_PART_DEV
+            ${SUDO_PREFIX}resize2fs $LAST_PART_DEV
+        elif [[ "$LAST_PART_FSTYPE" == "fat"* ]]; then
+            echo "Resizing FAT filesystem..."
+            ${SUDO_PREFIX}fatresize --size max $LAST_PART_DEV
+        fi
+        echo "Partition expansion complete!"
+    else
+        echo "Destination drive is not larger than source. Skipping expansion."
+    fi
+fi
+
+# Cleanup
+rmdir $SRC_MNT
+rmdir $DST_MNT
+
+echo "Cloning complete!"
